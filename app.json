@@ -1,0 +1,17 @@
+{
+  "name": "tfjsexpobare",
+  "displayName": "tfjsexpobare",
+  "expo": {
+    "name": "tfjsexpobare",
+    "slug": "tfjsexpobare",
+    "version": "1.0.0",
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "assetBundlePatterns": [
+      "**/*"
+    ]
+  }
+}
