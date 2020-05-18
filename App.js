@@ -19,11 +19,11 @@ import '@tensorflow/tfjs-react-native';
 
 import * as blazeface from '@tensorflow-models/blazeface';
 import * as tf from '@tensorflow/tfjs';
-import {bundleResourceIO, cameraWithTensors} from '@tensorflow/tfjs-react-native';
+import {bundleResourceIO, cameraWithTensors, fetch, decodeJpeg} from '@tensorflow/tfjs-react-native';
 import {Camera} from 'expo-camera';
 import * as Permissions from 'expo-permissions';
 import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
+import {StyleSheet, Text, View, Image} from 'react-native';
 import {IMAGENET_CLASSES} from './imagenet_classes';
 
 // We will also use a locally bundled version of mobilenet.
@@ -33,6 +33,11 @@ import {IMAGENET_CLASSES} from './imagenet_classes';
 // This is not compatible with managed expo apps.
 const modelJson = require('./models/mobilenetv2/model.json');
 const modelWeights = require('./models/mobilenetv2/group1-shard1of1.bin');
+let mobilenetModel;
+
+// We will make a mobilenet prediction on this image.
+const catImage = require('./images/catsmall.jpg');
+
 
 const TensorCamera = cameraWithTensors(Camera);
 const AUTORENDER = true;
@@ -42,8 +47,8 @@ const makePredictionEveryNFrames = 2;
 // Position of camera preview.
 const previewLeft = 40;
 const previewTop = 20;
-const previewWidth = 300;
-const previewHeight = 400;
+const previewWidth = 200;
+const previewHeight = 300;
 
 export default class App extends React.Component {
   constructor(props) {
@@ -84,16 +89,71 @@ export default class App extends React.Component {
     }
 
     const blazefaceModel = await this.loadBlazefaceModel();
-    const mobilenetModel = await this.loadLocalMobileNet();
+    mobilenetModel = await this.loadLocalMobileNet();    
+    const mobileNetPrediction = await this.makeMobilenetPredictionFromImage(catImage)
     this.setState({
       isTfReady: true,
       permissionsStatus: status,
-      faceDetector: blazefaceModel,
-      mobilenet: mobilenetModel,
+      faceDetector: blazefaceModel,      
       textureDims,
       tensorDims,
       scale,
+      mobilenetClasses: mobileNetPrediction,
     });
+  }
+
+  async makeMobilenetPredictionFromImage(image) {
+    const imageAssetPath = Image.resolveAssetSource(image);
+    console.log(imageAssetPath.uri);
+    const response = await fetch(imageAssetPath.uri, {}, { isBinary: true });
+    const rawImageData = await response.arrayBuffer();
+    const raw = new Uint8Array(rawImageData)    
+    const imageTensor = decodeJpeg(raw);
+    const pred = this.makeMobilenetPrediction(imageTensor);
+    console.warn('pred', pred);
+    imageTensor.dispose();
+    return pred;
+  }
+
+  makeMobilenetPrediction(imageTensor) {
+    const IMAGE_SIZE = 96;
+    const inputRange = [0, 1];
+    const normalizationConstant = inputRange[1] / 255;
+    const preProcessedImage = tf.tidy(() => {
+      const normalized = imageTensor.toFloat().mul(normalizationConstant);            
+      const alignCorners = true;
+      // Note it would probably be better to center crop 
+      // the image than to resize
+      const resized =
+        normalized.resizeBilinear([IMAGE_SIZE, IMAGE_SIZE], alignCorners)
+      const batchedImage = resized.expandDims();
+      return batchedImage;
+    })          
+    const pred = mobilenetModel.predict(preProcessedImage)
+
+    // post processing
+    const mobilenetClasses = tf.tidy(() => {
+      const topK = 3;
+      // Remove the very first logit (background noise).
+      const logits = pred.slice([0, 1], [-1, 1000]);
+      const softmax = logits.softmax();
+      const {values, indices} = softmax.topk(topK);
+      const topKValues = values.dataSync();
+      const topKIndices = indices.dataSync();
+
+      const topClassesAndProbs = [];
+      for (let i = 0; i < topKIndices.length; i++) {
+        topClassesAndProbs.push({
+          className: IMAGENET_CLASSES[topKIndices[i]],
+          probability: topKValues[i]
+        });
+      }
+      return topClassesAndProbs;
+    })
+
+    tf.dispose[pred, preProcessedImage];
+
+    return mobilenetClasses;
   }
 
   async handleImageTensorReady(images) {
@@ -101,55 +161,14 @@ export default class App extends React.Component {
       if (frameCount % makePredictionEveryNFrames === 0) {
         const imageTensor = images.next().value;
 
-        let faces;
-        let mobilenetClasses;
+        let faces;        
         if (this.state.faceDetector != null) {
           const returnTensors = false;
           faces = await this.state.faceDetector.estimateFaces(
               imageTensor, returnTensors);
         }
-
-        if (this.state.mobilenet != null) {
-          const IMAGE_SIZE = 96;
-          const inputRange = [0, 1];
-          const normalizationConstant = inputRange[1] / 255;
-          const preProcessedImage = tf.tidy(() => {
-            const normalized = imageTensor.toFloat().mul(normalizationConstant);            
-            const alignCorners = true;
-            // Note it would probably be better to center crop 
-            // the image than to resize
-            const resized =
-              normalized.resizeBilinear([IMAGE_SIZE, IMAGE_SIZE], alignCorners)
-            const batchedImage = resized.expandDims();
-            return batchedImage;
-          })          
-          const pred = await this.state.mobilenet.predict(preProcessedImage)
-
-          // post processing
-          mobilenetClasses = tf.tidy(() => {
-            const topK = 3;
-            // Remove the very first logit (background noise).
-            const logits = pred.slice([0, 1], [-1, 1000]);
-            const softmax = logits.softmax();
-            const {values, indices} = softmax.topk(topK);
-            const topKValues = values.dataSync();
-            const topKIndices = indices.dataSync();
-
-            const topClassesAndProbs = [];
-            for (let i = 0; i < topKIndices.length; i++) {
-              topClassesAndProbs.push({
-                className: IMAGENET_CLASSES[topKIndices[i]],
-                probability: topKValues[i]
-              });
-            }
-            return topClassesAndProbs;
-          })
-
-          tf.dispose[pred, preProcessedImage];
-        }
-
         tf.dispose(imageTensor);
-        this.setState({faces, mobilenetClasses});
+        this.setState({faces});
       }
 
       frameCount += 1;
@@ -228,6 +247,10 @@ export default class App extends React.Component {
         <Text># faces detected: {faces.length}</Text>
         {this.renderBoundingBoxes()}
         {this.renderFacesDebugInfo()}
+        <Image
+          style={styles.catImage}
+          source={require('./images/catsmall.jpg')}
+        />
         {this.renderMobileNetOutput()}
       </View>
     );
@@ -272,7 +295,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     width: '100%',
-    height: '80%',
+    height: '60%',
     backgroundColor: '#fff',
   },
   camera : {
@@ -291,5 +314,9 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: 'red',
     borderRadius: 0,
+  },
+  catImage: {
+    width: 100,
+    height: 100,
   }
 });
